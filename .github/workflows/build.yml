@@ -1,0 +1,92 @@
+# Reusable workflow: build a Guardhouse site repo, then upload the built dist/ to the Guardhouse API.
+# Called from each site repo's .github/workflows/guardhouse-build.yml. The CALLER must grant
+# `permissions: id-token: write` (a called workflow can only keep or reduce the caller's permissions).
+name: Guardhouse build and upload
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to build in the calling repository. Defaults to the caller's github.sha.
+        type: string
+        required: false
+        default: ""
+
+# github.* is the CALLER's context here, so this is per caller repo + ref.
+concurrency:
+  group: guardhouse-build-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      # Runs the site repo's own code (npm scripts). This job never has an OIDC token.
+      - name: Check out the calling repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Record built commit
+        id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: guardhouse-dist
+          path: dist/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  upload:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      # NEVER check out the calling repository in this job: it holds the OIDC token.
+      - name: Check out site-kit (the upload script)
+        uses: actions/checkout@v7
+        with:
+          repository: UseGuardhouse/site-kit
+          ref: main
+          path: .site-kit
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Download dist artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: guardhouse-dist
+          path: ${{ runner.temp }}/dist
+      - name: Upload to Guardhouse
+        env:
+          BUILT_SHA: ${{ needs.build.outputs.sha }}
+          # The calling repository, e.g. UseGuardhouse/acme or UseGuardhouse/acme-stg.
+          CALLER_REPOSITORY: ${{ github.repository }}
+          DIST_DIR: ${{ runner.temp }}/dist
+        run: |
+          repo_name="${CALLER_REPOSITORY#*/}"
+          case "$repo_name" in
+            *-stg) target=staging ;;
+            *) target=production ;;
+          esac
+          echo "Environment: $target"
+          node .site-kit/scripts/upload.mjs --env "$target" --dir "$DIST_DIR" --commit "$BUILT_SHA"
