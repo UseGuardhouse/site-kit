@@ -1,0 +1,9 @@
+name: zz probe outer
+on:
+  workflow_call:
+permissions: {}
+jobs:
+  inner:
+    permissions:
+      id-token: write
+    uses: UseGuardhouse/site-kit/.github/workflows/zz-probe-inner.yml@main
