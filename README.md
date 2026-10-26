@@ -7,7 +7,7 @@ Public, secret-free tooling for [Guardhouse](https://useguardhouse.com) customer
 - `.github/workflows/build.yml` (`workflow_call`): builds the calling repo (`npm ci && npm run build`), then uploads `dist/` to the Guardhouse ingest API. Environment is production unless the calling repository name ends in `-stg`.
 - `edit.yml`: **upcoming (Stage 2).** Chat-driven edits drafted with Claude. Not present yet.
 
-`scripts/upload.mjs` is the zero-dependency upload client (check, PUT missing blobs, finalize). `ci.yml` tests it (`node --test scripts/`) and lints workflows with actionlint.
+`scripts/upload.mjs` is the zero-dependency upload client (check, PUT missing blobs, finalize). `ci.yml` tests it (`node --test "scripts/*.test.mjs"`) and lints workflows with actionlint.
 
 ## Security model
 
