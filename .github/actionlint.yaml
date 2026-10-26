@@ -1,0 +1,6 @@
+# actionlint's bundled metadata for anthropics/claude-code-action@v1 predates the workload identity federation
+# inputs; they exist in the real v1 action.yml (verified), so silence just that complaint.
+paths:
+  .github/workflows/edit.yml:
+    ignore:
+      - 'input "anthropic_(federation_rule_id|organization_id|service_account_id|workspace_id)" is not defined in action "anthropics/claude-code-action@v1"'

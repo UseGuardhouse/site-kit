@@ -7,11 +7,9 @@ import { createReadStream } from "node:fs";
 import { appendFile, lstat, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { ApiError, ORIGINS, createClient, githubTokenProvider } from "./lib.mjs";
 
-export const ORIGINS = Object.freeze({
-  production: "https://useguardhouse.com",
-  staging: "https://staging.useguardhouse.com",
-});
+export { ORIGINS, ApiError, githubTokenProvider } from "./lib.mjs";
 
 const TEXT = "; charset=utf-8";
 const TYPES = {
@@ -74,34 +72,6 @@ export async function walk(dir) {
   return out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 }
 
-export class ApiError extends Error {
-  constructor(status, code, message) {
-    super(`${code}: ${message}`);
-    this.status = status;
-    this.code = code;
-  }
-}
-
-/** Token provider backed by the Actions OIDC endpoint. Never logs the token. */
-export function githubTokenProvider(env = process.env, fetchImpl = fetch) {
-  return async (audience) => {
-    const url = env.ACTIONS_ID_TOKEN_REQUEST_URL;
-    const bearer = env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
-    if (!url || !bearer) {
-      throw new Error("OIDC token request is unavailable (the calling job needs `permissions: id-token: write`).");
-    }
-    const res = await fetchImpl(`${url}&audience=${encodeURIComponent(audience)}`, {
-      headers: { authorization: `Bearer ${bearer}`, accept: "application/json" },
-    });
-    if (!res.ok) throw new Error(`OIDC token request failed with HTTP ${res.status}`);
-    const body = await res.json();
-    if (!body?.value) throw new Error("OIDC token response had no value");
-    return body.value;
-  };
-}
-
-const sleepReal = (ms) => new Promise((r) => setTimeout(r, ms));
-
 /**
  * Upload dir as one build.
  * api: { origin, getToken(audience) } (tests inject these; the CLI builds them from --env).
@@ -112,57 +82,14 @@ export async function upload(api, opts) {
     dir,
     commitSha,
     fetch: fetchImpl = fetch,
-    sleep = sleepReal,
+    sleep,
     now = Date.now,
     tokenMaxAgeMs = 4 * 60 * 1000,
     concurrency = 8,
     retries = 3,
     log = () => {},
   } = opts;
-  const origin = api.origin.replace(/\/$/, "");
-
-  let token = null;
-  let tokenAt = 0;
-  async function bearer() {
-    if (!token || now() - tokenAt > tokenMaxAgeMs) {
-      token = await api.getToken(origin);
-      tokenAt = now();
-    }
-    return token;
-  }
-
-  async function request(method, path, { json, body, headers = {} } = {}) {
-    for (let attempt = 0; ; attempt++) {
-      let res;
-      try {
-        const h = { ...headers, authorization: `Bearer ${await bearer()}` };
-        if (json !== undefined) h["content-type"] = "application/json";
-        res = await fetchImpl(origin + path, {
-          method,
-          headers: h,
-          body: json !== undefined ? JSON.stringify(json) : body,
-        });
-      } catch (err) {
-        if (err instanceof ApiError || attempt >= retries || /OIDC/.test(String(err?.message))) throw err;
-        await sleep(500 * 2 ** attempt);
-        continue;
-      }
-      if (res.ok) return res;
-      if ((res.status >= 500 || res.status === 429) && attempt < retries) {
-        await res.arrayBuffer().catch(() => {});
-        await sleep(500 * 2 ** attempt);
-        continue;
-      }
-      let code = `http_${res.status}`;
-      let message = res.statusText || "request failed";
-      try {
-        const b = await res.json();
-        if (b?.error?.code) code = String(b.error.code);
-        if (b?.error?.message) message = String(b.error.message);
-      } catch {}
-      throw new ApiError(res.status, code, message);
-    }
-  }
+  const { request } = createClient(api, { fetch: fetchImpl, sleep, now, tokenMaxAgeMs, retries });
 
   const found = await walk(dir);
   if (found.length === 0) throw new Error(`No files found in ${dir}`);

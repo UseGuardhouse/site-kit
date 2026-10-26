@@ -12,9 +12,10 @@ on:
         required: false
         default: ""
 
-# github.* is the CALLER's context here, so this is per caller repo + ref.
+# github.* is the CALLER's context here, so this is per caller repo + ref (+ the requested commit, so preview
+# builds of edit branches do not displace a pending build of main).
 concurrency:
-  group: guardhouse-build-${{ github.repository }}-${{ github.ref }}
+  group: guardhouse-build-${{ github.repository }}-${{ github.ref }}-${{ inputs.ref }}
   cancel-in-progress: false
 
 permissions: {}

@@ -1,0 +1,283 @@
+# Reusable workflow: draft a chat-requested change with Claude, check it against the diff policy, push it to a
+# change/<crId> branch, and build/upload it as a preview. Called from each site repo's guardhouse-edit.yml
+# (workflow_dispatch, dispatched by the Guardhouse API). The CALLER must grant `contents: write` and `id-token: write`
+# (a called workflow can only keep or reduce the caller's permissions).
+#
+# Trust boundaries (see README):
+#   edit  : runs Claude with read/write file tools only (no Bash, no network tools), read-only GITHUB_TOKEN, and the
+#           customer's text as untrusted DATA in .guardhouse/request.json. No site-kit or repo code runs after Claude.
+#   push  : no Claude. Treats the edited workspace as data: change set -> policy -> lint -> commit -> push.
+#   build : the normal build.yml (repo code without a token, then a token-holding upload job that never checks out the repo).
+name: Guardhouse edit
+
+on:
+  workflow_call:
+    inputs:
+      job_id:
+        description: Guardhouse edit job id (from the dispatch).
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  edit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      prepared: ${{ steps.prepare.outputs.prepared }}
+      base_ref: ${{ steps.prepare.outputs.base_ref }}
+      base_sha: ${{ steps.base.outputs.sha }}
+    steps:
+      - name: Check out site-kit (job scripts)
+        uses: actions/checkout@v7
+        with:
+          repository: UseGuardhouse/site-kit
+          ref: main
+          path: .site-kit
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      # Keep the scripts outside the workspace so Claude's workspace never contains site-kit.
+      - name: Move job scripts out of the workspace
+        run: |
+          cp -R .site-kit/scripts "$RUNNER_TEMP/site-kit-scripts"
+          rm -rf .site-kit
+      - name: Fetch the job bundle and report started
+        id: prepare
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+        run: |
+          node "$RUNNER_TEMP/site-kit-scripts/job.mjs" prepare \
+            --job "$JOB_ID" --repository "$CALLER_REPOSITORY" --out "$RUNNER_TEMP/gh-job"
+      # Uploaded BEFORE Claude runs so later jobs read an untampered copy.
+      - name: Upload job bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: job-bundle
+          path: ${{ runner.temp }}/gh-job
+          if-no-files-found: error
+          retention-days: 1
+      - name: Check out the calling repository at the base ref
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.prepare.outputs.base_ref }}
+          persist-credentials: false
+      - name: Record the base commit
+        id: base
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Place the customer request and media (data only)
+        run: node "$RUNNER_TEMP/site-kit-scripts/job.mjs" place --bundle "$RUNNER_TEMP/gh-job" --dest "$GITHUB_WORKSPACE"
+      - name: Read the prompt
+        id: prompt
+        run: |
+          delim="GH_PROMPT_$(openssl rand -hex 16)"
+          {
+            echo "text<<${delim}"
+            cat "$RUNNER_TEMP/gh-job/prompt.txt"
+            echo
+            echo "${delim}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Draft the change with Claude
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          # Workload identity federation: no API key exists or is used.
+          anthropic_federation_rule_id: fdrl_01KggydPWA6reUBtSCfUhCQH
+          anthropic_organization_id: 30f6146d-2b7d-409f-b7bf-fcc2a04ac761
+          anthropic_service_account_id: svac_01VHtikXgaMocPBH6fi9A513
+          anthropic_workspace_id: wrkspc_013A3oF5cuZfEWRfaswt6UUm
+          # Read-only job token (permissions: contents: read).
+          github_token: ${{ github.token }}
+          # The Guardhouse API dispatches this run through its GitHub App, which the action treats as a bot actor.
+          allowed_bots: useguardhouse-sites
+          # No comments, no tracking, no report in the step summary.
+          track_progress: "false"
+          use_sticky_comment: "false"
+          classify_inline_comments: "false"
+          include_fix_links: "false"
+          display_report: "false"
+          show_full_output: "false"
+          prompt: ${{ steps.prompt.outputs.text }}
+          claude_args: |
+            --model ${{ steps.prepare.outputs.model }}
+            --max-turns ${{ steps.prepare.outputs.max_turns }}
+            --allowedTools "Read,Edit,Write,Glob,Grep"
+            --disallowedTools "Bash,WebFetch,WebSearch,NotebookEdit,Task,mcp__github,mcp__github_comment,mcp__github_file_ops,mcp__github_inline_comment,mcp__github_ci"
+            --json-schema '{"type":"object","additionalProperties":false,"required":["summary","changed","needs_human","question"],"properties":{"summary":{"type":"string"},"changed":{"type":"boolean"},"needs_human":{"type":"boolean"},"question":{"type":["string","null"]}}}'
+          settings: |
+            {
+              "permissions": {
+                "deny": [
+                  "Read(//proc/**)",
+                  "Read(//sys/**)",
+                  "Read(//etc/**)",
+                  "Read(//root/**)",
+                  "Read(/${{ runner.temp }}/**)",
+                  "Read(//home/runner/work/_actions/**)",
+                  "Read(//home/runner/runners/**)",
+                  "Read(~/.*)",
+                  "Read(~/.*/**)",
+                  "Read(.git/**)",
+                  "Edit(.git/**)",
+                  "Edit(.github/**)",
+                  "Edit(.claude/**)",
+                  "Edit(.guardhouse/**)",
+                  "Edit(CLAUDE.md)",
+                  "Edit(CLAUDE.local.md)",
+                  "Edit(.mcp.json)",
+                  "Edit(.npmrc)",
+                  "Edit(package*.json)",
+                  "Edit(tsconfig*.json)",
+                  "Edit(astro.config.*)",
+                  "Edit(public/_headers)",
+                  "Edit(public/_redirects)"
+                ]
+              }
+            }
+      # From here on NO repo or site-kit code runs: only shell printf/cp/tar/find.
+      - name: Collect results
+        env:
+          STRUCTURED_OUTPUT: ${{ steps.claude.outputs.structured_output }}
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+        run: |
+          set -euo pipefail
+          res="$RUNNER_TEMP/gh-result"
+          ws="$RUNNER_TEMP/gh-workspace"
+          mkdir -p "$res" "$ws"
+          printf '%s' "$STRUCTURED_OUTPUT" > "$res/result.json"
+          if [ -n "$EXECUTION_FILE" ] && [ -f "$EXECUTION_FILE" ]; then
+            cp "$EXECUTION_FILE" "$res/execution.json"
+          fi
+          tar -C "$GITHUB_WORKSPACE" \
+            --exclude=./.git --exclude=./node_modules --exclude=./.guardhouse --exclude=./dist --exclude=./.astro \
+            -cf - . | tar -C "$ws" -xf -
+          # Symlinks are never uploaded (artifacts would follow them); their paths go to the policy check instead.
+          (cd "$ws" && find . -type l -print0 > "$res/symlinks.bin" && find . -type l -delete)
+      - name: Upload edited workspace
+        uses: actions/upload-artifact@v7
+        with:
+          name: edit-workspace
+          path: ${{ runner.temp }}/gh-workspace
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+      - name: Upload result
+        uses: actions/upload-artifact@v7
+        with:
+          name: edit-result
+          path: ${{ runner.temp }}/gh-result
+          if-no-files-found: error
+          retention-days: 1
+
+  push:
+    needs: edit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+    outputs:
+      head_sha: ${{ steps.push.outputs.head_sha }}
+      pushed: ${{ steps.push.outputs.pushed }}
+    steps:
+      # The edited workspace is DATA here; nothing from it is executed. This job has no Claude.
+      - name: Check out the calling repository at the commit the edit started from
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.edit.outputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Check out site-kit (job scripts)
+        uses: actions/checkout@v7
+        with:
+          repository: UseGuardhouse/site-kit
+          ref: main
+          path: .site-kit
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Download job bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: job-bundle
+          path: ${{ runner.temp }}/gh-job
+      - name: Download edited workspace
+        uses: actions/download-artifact@v8
+        with:
+          name: edit-workspace
+          path: ${{ runner.temp }}/gh-workspace
+      - name: Download result
+        uses: actions/download-artifact@v8
+        with:
+          name: edit-result
+          path: ${{ runner.temp }}/gh-result
+      - name: Policy, lint, commit and push
+        id: push
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+        run: |
+          node .site-kit/scripts/job.mjs push \
+            --job "$JOB_ID" --repository "$CALLER_REPOSITORY" \
+            --bundle "$RUNNER_TEMP/gh-job" --workspace "$RUNNER_TEMP/gh-workspace" --result "$RUNNER_TEMP/gh-result" \
+            --checkout "$GITHUB_WORKSPACE"
+
+  build:
+    needs: push
+    if: needs.push.outputs.pushed == 'true'
+    # Nested reusable workflow: its upload job's OIDC job_workflow_ref is build.yml@refs/heads/main.
+    permissions:
+      contents: read
+      id-token: write
+    uses: UseGuardhouse/site-kit/.github/workflows/build.yml@main
+    with:
+      ref: ${{ needs.push.outputs.head_sha }}
+
+  report-failure:
+    needs: [edit, push, build]
+    if: failure() || cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Check out site-kit (job scripts)
+        uses: actions/checkout@v7
+        with:
+          repository: UseGuardhouse/site-kit
+          ref: main
+          path: .site-kit
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Report failure to Guardhouse
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+          EDIT_RESULT: ${{ needs.edit.result }}
+          EDIT_PREPARED: ${{ needs.edit.outputs.prepared }}
+          PUSH_RESULT: ${{ needs.push.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          if [ "$EDIT_RESULT" != "success" ]; then
+            if [ "$EDIT_PREPARED" = "true" ]; then stage=edit; else stage=prepare; fi
+            result="$EDIT_RESULT"
+          elif [ "$PUSH_RESULT" != "success" ]; then
+            stage=push
+            result="$PUSH_RESULT"
+          else
+            stage=build
+            result="$BUILD_RESULT"
+          fi
+          node .site-kit/scripts/job.mjs fail \
+            --job "$JOB_ID" --repository "$CALLER_REPOSITORY" \
+            --stage "$stage" --message "The $stage stage ended with result: $result. See the workflow run for details."
