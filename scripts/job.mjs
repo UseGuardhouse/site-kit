@@ -208,6 +208,11 @@ export async function push({ client, jobId, bundleDir, workspaceDir, resultDir, 
   // 3. Lint (findings, not failures).
   const lintFiles = [];
   for (const c of changes) {
+    if (c.status === "deleted" && c.path.startsWith("src/forms/")) {
+      // Reported as form_definition; there is no new text to lint.
+      lintFiles.push({ path: c.path, oldText: "", newText: "", status: "deleted" });
+      continue;
+    }
     if ((c.status !== "added" && c.status !== "modified") || !isText(c.path)) continue;
     lintFiles.push({
       path: c.path,

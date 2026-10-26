@@ -156,6 +156,39 @@ describe("lint", () => {
     const old = "---\nimport x from 'left-pad';\n---\n<p/>";
     assert.deepEqual(rules([f("src/pages/a.astro", old.replace("<p/>", "<p>1</p>") + "\n", old)]), []);
   });
+  test("form_definition: added, modified and deleted files under src/forms/", () => {
+    const out = lint(
+      [
+        f("src/forms/contact.json", "{}"),
+        f("src/forms/quote-request.json", '{"a":2}', '{"a":1}'),
+        { path: "src/forms/old.json", oldText: "", newText: "", status: "deleted" },
+        f("src/content/forms/x.json", "{}"),
+        f("src/forms/readme.txt", "x"),
+      ],
+      policy,
+    ).filter((x) => x.rule === "form_definition");
+    assert.deepEqual(out.map((x) => x.file), ["src/forms/contact.json", "src/forms/quote-request.json", "src/forms/old.json"]);
+    assert.match(out[0].detail, /"contact".*added/);
+    assert.match(out[1].detail, /"quote-request".*modified/);
+    assert.match(out[2].detail, /"old".*deleted/);
+  });
+  const rawCases = [
+    ["<form> tag", "src/pages/a.astro", '<form action="/x" method="post">', ["raw_form"]],
+    ["input", "src/content/pages/a.md", '<input type="text" name="q">', ["raw_form"]],
+    ["select", "src/components/X.astro", "<select name=a>", ["raw_form"]],
+    ["textarea uppercase", "src/pages/a.html", "<TEXTAREA></TEXTAREA>", ["raw_form"]],
+    ["not a form element", "src/pages/a.astro", "<formatted>x</formatted> <inputs-list/>", []],
+    ["inside src/guardhouse", "src/guardhouse/GuardhouseForm.astro", "<form><input></form>", []],
+    ["plain text file ignored", "src/forms/notes.txt", "<form>", []],
+  ];
+  for (const [name, path, text, expected] of rawCases) {
+    test(`raw_form: ${name}`, () => assert.deepEqual(rules([f(path, text)]).filter((r) => r === "raw_form"), expected));
+  }
+  test("raw_form only for newly added lines", () => {
+    const old = '<form action="/x">';
+    assert.deepEqual(rules([f("src/pages/a.astro", old + "\n<p>new</p>", old)]), []);
+    assert.deepEqual(rules([f("src/pages/a.astro", old + "\n<input name=q>", old)]), ["raw_form"]);
+  });
   test("binary and unknown file types are skipped", () => {
     assert.deepEqual(rules([f("public/uploads/a.jpg", "<script>")]), []);
   });

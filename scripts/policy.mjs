@@ -194,6 +194,11 @@ function frontmatterRange(lines) {
   return null;
 }
 
+/** src/forms/<id>.json: form definitions (the forms service validates them; this only surfaces the change for review). */
+const FORM_DEF_RE = /^src\/forms\/(.+)\.json$/;
+/** A hand-written form or form control outside src/guardhouse/ would bypass the forms service. */
+const RAW_FORM_RE = /<(?:form|input|select|textarea)\b/i;
+
 const IMPORT_RES = [/^\s*import\s[^'"]*?from\s*['"]([^'"]+)['"]/, /^\s*import\s*['"]([^'"]+)['"]/, /\bimport\s*\(\s*['"]?([^'")]*)/];
 
 /**
@@ -205,7 +210,14 @@ export function lint(files, policy) {
   const findings = [];
   const add = (rule, file, line, detail) => findings.push({ rule, file: file.slice(0, 512), line, detail: detail.slice(0, 300) });
   for (const f of files) {
+    const formDef = FORM_DEF_RE.exec(f.path);
+    if (formDef) {
+      const status = f.status ?? (f.oldText === "" ? "added" : f.newText === "" ? "deleted" : "modified");
+      add("form_definition", f.path, 1, `Form "${formDef[1]}" definition ${status}.`);
+    }
     if (!isText(f.path)) continue;
+    // Deleted files have nothing new to lint.
+    if (f.status === "deleted") continue;
     const oldLines = f.oldText.split("\n");
     const newLines = f.newText.split("\n");
     const remaining = new Map();
@@ -233,6 +245,7 @@ export function lint(files, policy) {
       if (MARKUP_EXT.has(ext(f.path)) && /(^|[\s"'`<>/])on[a-z]{3,}\s*=/i.test(line)) add("event_handler", f.path, n, `New inline event handler: ${snippet}`);
       if (/javascript\s*:/i.test(line)) add("javascript_url", f.path, n, `New javascript: URL: ${snippet}`);
       if (/set:html/.test(line)) add("set_html", f.path, n, `New set:html: ${snippet}`);
+      if (RAW_FORM_RE.test(line) && MARKUP_EXT.has(ext(f.path)) && !f.path.startsWith("src/guardhouse/")) add("raw_form", f.path, n, `New raw form markup (use GuardhouseForm): ${snippet}`);
       if (/<iframe\b/i.test(line)) add("iframe", f.path, n, `New <iframe>: ${snippet}`);
       for (const host of hostsIn(line)) {
         if (allowedHosts.has(host) || oldHosts.has(host) || NAMESPACE_HOSTS.has(host) || reportedHosts.has(host)) continue;
