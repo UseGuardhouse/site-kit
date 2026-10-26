@@ -102,7 +102,7 @@ jobs:
           classify_inline_comments: "false"
           include_fix_links: "false"
           display_report: "false"
-          show_full_output: "false"
+          show_full_output: "true" # TEMP: debugging the first real run; revert
           prompt: ${{ steps.prompt.outputs.text }}
           claude_args: |
             --model ${{ steps.prepare.outputs.model }}
